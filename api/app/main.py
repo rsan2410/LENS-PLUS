@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from random import choice, random
+from time import monotonic
 from typing import Any
 
 import av.logging
@@ -41,18 +45,69 @@ class IceResponse(BaseModel):
     ok: bool
 
 
+DEFAULT_ANALYSIS_TARGET_FPS = 5.0
+MIN_ANALYSIS_TARGET_FPS = 1.0
+MAX_ANALYSIS_TARGET_FPS = 30.0
+FPS_WINDOW_SECONDS = 1.0
+SESSION_MANIFEST_FILENAME = "session.json"
+
+
+def clamp_analysis_fps(value: float) -> float:
+    if not math.isfinite(value):
+        return DEFAULT_ANALYSIS_TARGET_FPS
+
+    return max(MIN_ANALYSIS_TARGET_FPS, min(MAX_ANALYSIS_TARGET_FPS, value))
+
+
+def load_analysis_target_fps_from_env() -> float:
+    raw_value = os.getenv("ANALYSIS_TARGET_FPS")
+    if raw_value is None:
+        return DEFAULT_ANALYSIS_TARGET_FPS
+
+    try:
+        return clamp_analysis_fps(float(raw_value))
+    except ValueError:
+        return DEFAULT_ANALYSIS_TARGET_FPS
+
+
+CONFIGURED_ANALYSIS_TARGET_FPS = load_analysis_target_fps_from_env()
+
+
+def load_session_artifacts_root_from_env() -> Path:
+    raw_value = os.getenv("SESSION_ARTIFACTS_DIR")
+    if raw_value:
+        return Path(raw_value).expanduser().resolve()
+
+    return Path(__file__).resolve().parent / "session_artifacts"
+
+
+SESSION_ARTIFACTS_ROOT = load_session_artifacts_root_from_env()
+
+
 @dataclass
 class Session:
     peer_connection: RTCPeerConnection
     data_channel: Any | None = None
     frame_task: asyncio.Task[None] | None = None
     mock_task: asyncio.Task[None] | None = None
+    analysis_target_fps: float = CONFIGURED_ANALYSIS_TARGET_FPS
     total_frames: int = 0
+    processed_frames: int = 0
+    dropped_frames: int = 0
+    incoming_fps: float = 0.0
+    processed_fps: float = 0.0
     last_frame_at: datetime | None = None
     latest_jpeg: bytes | None = None
     latest_jpeg_at: datetime | None = None
     snapshot_errors: int = 0
     last_snapshot_error: str | None = None
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    artifact_id: str | None = None
+    artifact_dir: Path | None = None
+    artifact_manifest_path: Path | None = None
+    dumped_frames: int = 0
+    dump_errors: int = 0
+    last_dump_error: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -71,6 +126,7 @@ sessions: dict[str, Session] = {}
 @app.on_event("startup")
 async def startup() -> None:
     av.logging.set_level(av.logging.ERROR)
+    SESSION_ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
     app.state.gc_task = asyncio.create_task(session_gc())
 
 
@@ -97,7 +153,12 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                 "session_id": session_id,
                 "connection_state": session.peer_connection.connectionState,
                 "ice_state": session.peer_connection.iceConnectionState,
+                "analysis_target_fps": session.analysis_target_fps,
                 "total_frames": session.total_frames,
+                "processed_frames": session.processed_frames,
+                "dropped_frames": session.dropped_frames,
+                "incoming_fps": session.incoming_fps,
+                "processed_fps": session.processed_fps,
                 "last_frame_at": (
                     session.last_frame_at.isoformat() if session.last_frame_at else None
                 ),
@@ -109,11 +170,24 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                 "has_snapshot": session.latest_jpeg is not None,
                 "snapshot_errors": session.snapshot_errors,
                 "last_snapshot_error": session.last_snapshot_error,
+                "started_at": session.started_at.isoformat(),
+                "artifact_id": session.artifact_id,
+                "artifact_dir": str(session.artifact_dir)
+                if session.artifact_dir
+                else None,
+                "dumped_frames": session.dumped_frames,
+                "dump_errors": session.dump_errors,
+                "last_dump_error": session.last_dump_error,
                 "updated_at": session.updated_at.isoformat(),
             }
         )
 
     return {"sessions": session_list}
+
+
+@app.get("/debug/sessions/history")
+async def debug_sessions_history() -> dict[str, list[dict[str, Any]]]:
+    return {"sessions": load_session_history()}
 
 
 @app.get("/debug/sessions/{session_id}/latest.jpg")
@@ -134,11 +208,30 @@ async def debug_latest_snapshot(session_id: str) -> Response:
 
 @app.post("/webrtc/offer", response_model=OfferResponse)
 async def offer(payload: OfferRequest) -> OfferResponse:
+    for existing_session_id in list(sessions.keys()):
+        await close_session(existing_session_id)
+
     peer_connection = RTCPeerConnection()
 
     session_id = payload.session_id or str(uuid.uuid4())
-    session = Session(peer_connection=peer_connection)
+    session_started_at = datetime.now(timezone.utc)
+    artifact_id, artifact_dir, artifact_manifest_path, artifact_error = (
+        create_session_artifact(session_id=session_id, started_at=session_started_at)
+    )
+    session = Session(
+        peer_connection=peer_connection,
+        started_at=session_started_at,
+        updated_at=session_started_at,
+        artifact_id=artifact_id,
+        artifact_dir=artifact_dir,
+        artifact_manifest_path=artifact_manifest_path,
+    )
+    if artifact_error is not None:
+        session.dump_errors += 1
+        session.last_dump_error = artifact_error
+
     sessions[session_id] = session
+    write_session_manifest(session_id, session)
 
     @peer_connection.on("track")
     async def on_track(track: Any) -> None:
@@ -149,24 +242,68 @@ async def offer(payload: OfferRequest) -> OfferResponse:
 
         async def consume_frames() -> None:
             last_snapshot_at = datetime.min.replace(tzinfo=timezone.utc)
+            fps_window_started_at = monotonic()
+            window_incoming_frames = 0
+            window_processed_frames = 0
+            next_analysis_at = 0.0
+
+            def update_fps_window(now_mono: float) -> None:
+                nonlocal fps_window_started_at
+                nonlocal window_incoming_frames
+                nonlocal window_processed_frames
+
+                elapsed = now_mono - fps_window_started_at
+                if elapsed < FPS_WINDOW_SECONDS:
+                    return
+
+                session.incoming_fps = round(window_incoming_frames / elapsed, 2)
+                session.processed_fps = round(window_processed_frames / elapsed, 2)
+                fps_window_started_at = now_mono
+                window_incoming_frames = 0
+                window_processed_frames = 0
+
             while True:
                 try:
                     frame = await track.recv()
                     now = datetime.now(timezone.utc)
+                    now_mono = monotonic()
                     session.total_frames += 1
                     session.last_frame_at = now
                     session.updated_at = now
+                    window_incoming_frames += 1
 
-                    if (now - last_snapshot_at).total_seconds() >= 0.5:
-                        snapshot, snapshot_error = frame_to_jpeg(frame)
-                        if snapshot:
-                            session.latest_jpeg = snapshot
+                    target_analysis_fps = clamp_analysis_fps(
+                        session.analysis_target_fps
+                    )
+                    analysis_interval_seconds = 1.0 / target_analysis_fps
+
+                    if now_mono < next_analysis_at:
+                        session.dropped_frames += 1
+                        update_fps_window(now_mono)
+                        continue
+
+                    next_analysis_at = now_mono + analysis_interval_seconds
+                    session.processed_frames += 1
+                    window_processed_frames += 1
+
+                    frame_jpeg, frame_jpeg_error = frame_to_jpeg(frame)
+                    if frame_jpeg:
+                        persist_processed_frame(
+                            session=session,
+                            frame_jpeg=frame_jpeg,
+                            frame_at=now,
+                        )
+
+                        if (now - last_snapshot_at).total_seconds() >= 0.5:
+                            session.latest_jpeg = frame_jpeg
                             session.latest_jpeg_at = now
                             last_snapshot_at = now
                             session.last_snapshot_error = None
-                        else:
-                            session.snapshot_errors += 1
-                            session.last_snapshot_error = snapshot_error
+                    else:
+                        session.snapshot_errors += 1
+                        session.last_snapshot_error = frame_jpeg_error
+
+                    update_fps_window(now_mono)
                 except Exception:
                     break
 
@@ -269,11 +406,15 @@ async def close_session(session_id: str) -> None:
     if not session:
         return
 
+    closed_at = datetime.now(timezone.utc)
+
     for task in [session.frame_task, session.mock_task]:
         if task:
             task.cancel()
 
     await session.peer_connection.close()
+    session.updated_at = closed_at
+    write_session_manifest(session_id, session, closed_at=closed_at)
 
 
 async def session_gc(timeout_seconds: int = 60) -> None:
@@ -304,6 +445,158 @@ async def wait_for_ice_gathering(
         await asyncio.wait_for(_wait(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         return
+
+
+def sanitize_artifact_component(value: str) -> str:
+    safe_chars: list[str] = []
+    for char in value:
+        if char.isalnum() or char in {"-", "_"}:
+            safe_chars.append(char)
+        else:
+            safe_chars.append("_")
+
+    sanitized = "".join(safe_chars).strip("_")
+    return sanitized or "session"
+
+
+def create_session_artifact(
+    session_id: str, started_at: datetime
+) -> tuple[str | None, Path | None, Path | None, str | None]:
+    safe_session_id = sanitize_artifact_component(session_id)
+    started_fragment = started_at.strftime("%Y%m%dT%H%M%S%fZ")
+    artifact_id = f"{started_fragment}--{safe_session_id}"
+    artifact_dir = SESSION_ARTIFACTS_ROOT / artifact_id
+    artifact_manifest_path = artifact_dir / SESSION_MANIFEST_FILENAME
+
+    try:
+        artifact_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        artifact_id = f"{artifact_id}--{uuid.uuid4().hex[:8]}"
+        artifact_dir = SESSION_ARTIFACTS_ROOT / artifact_id
+        artifact_manifest_path = artifact_dir / SESSION_MANIFEST_FILENAME
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=False)
+        except Exception as error:
+            return None, None, None, f"artifact init failed: {error}"
+    except Exception as error:
+        return None, None, None, f"artifact init failed: {error}"
+
+    return artifact_id, artifact_dir, artifact_manifest_path, None
+
+
+def persist_processed_frame(
+    session: Session, frame_jpeg: bytes, frame_at: datetime
+) -> None:
+    if session.artifact_dir is None:
+        return
+
+    frame_name = (
+        f"frame-{session.processed_frames:06d}-"
+        f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
+    )
+    frame_path = session.artifact_dir / frame_name
+
+    try:
+        frame_path.write_bytes(frame_jpeg)
+        session.dumped_frames += 1
+        session.last_dump_error = None
+    except Exception as error:
+        session.dump_errors += 1
+        session.last_dump_error = f"frame dump failed: {error}"
+
+
+def build_session_manifest(
+    session_id: str,
+    session: Session,
+    closed_at: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "artifact_id": session.artifact_id,
+        "artifact_dir": str(session.artifact_dir) if session.artifact_dir else None,
+        "started_at": session.started_at.isoformat(),
+        "closed_at": closed_at.isoformat() if closed_at else None,
+        "analysis_target_fps": session.analysis_target_fps,
+        "total_frames": session.total_frames,
+        "processed_frames": session.processed_frames,
+        "dropped_frames": session.dropped_frames,
+        "incoming_fps": session.incoming_fps,
+        "processed_fps": session.processed_fps,
+        "dumped_frames": session.dumped_frames,
+        "dump_errors": session.dump_errors,
+        "last_dump_error": session.last_dump_error,
+        "latest_jpeg_at": (
+            session.latest_jpeg_at.isoformat() if session.latest_jpeg_at else None
+        ),
+        "last_frame_at": session.last_frame_at.isoformat()
+        if session.last_frame_at
+        else None,
+        "updated_at": session.updated_at.isoformat(),
+    }
+
+
+def write_session_manifest(
+    session_id: str,
+    session: Session,
+    closed_at: datetime | None = None,
+) -> None:
+    if session.artifact_manifest_path is None:
+        return
+
+    payload = build_session_manifest(
+        session_id=session_id,
+        session=session,
+        closed_at=closed_at,
+    )
+
+    try:
+        session.artifact_manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+    except Exception as error:
+        session.dump_errors += 1
+        session.last_dump_error = f"manifest write failed: {error}"
+
+
+def load_session_history(limit: int = 100) -> list[dict[str, Any]]:
+    if not SESSION_ARTIFACTS_ROOT.exists():
+        return []
+
+    history: list[dict[str, Any]] = []
+    artifact_dirs = sorted(
+        [entry for entry in SESSION_ARTIFACTS_ROOT.iterdir() if entry.is_dir()],
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+    for artifact_dir in artifact_dirs[:limit]:
+        manifest_path = artifact_dir / SESSION_MANIFEST_FILENAME
+        if manifest_path.exists():
+            try:
+                payload = json.loads(manifest_path.read_text())
+                if isinstance(payload, dict):
+                    history.append(payload)
+                    continue
+            except Exception as error:
+                history.append(
+                    {
+                        "artifact_id": artifact_dir.name,
+                        "artifact_dir": str(artifact_dir),
+                        "manifest_error": str(error),
+                    }
+                )
+                continue
+
+        frame_files = [
+            entry for entry in artifact_dir.iterdir() if entry.name.endswith(".jpg")
+        ]
+        history.append(
+            {
+                "artifact_id": artifact_dir.name,
+                "artifact_dir": str(artifact_dir),
+                "dumped_frames": len(frame_files),
+            }
+        )
+
+    return history
 
 
 def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
