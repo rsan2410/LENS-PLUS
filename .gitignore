@@ -15,3 +15,6 @@ node_modules/
 web/node_modules/
 web/dist/
 web/certs/
+
+# Runtime artifacts
+api/app/session_artifacts/

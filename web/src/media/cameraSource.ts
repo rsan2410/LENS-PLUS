@@ -1,4 +1,4 @@
-export async function startCameraStream(): Promise<MediaStream> {
+export async function startCameraStream(targetFramerate = 15): Promise<MediaStream> {
   if (!("mediaDevices" in navigator) || !navigator.mediaDevices) {
     const secureHint =
       !window.isSecureContext
@@ -11,13 +11,28 @@ export async function startCameraStream(): Promise<MediaStream> {
     throw new Error("getUserMedia is not available in this browser.");
   }
 
+  const viewportIsPortrait = window.matchMedia("(orientation: portrait)").matches;
+  const idealWidth = viewportIsPortrait ? 720 : 1280;
+  const idealHeight = viewportIsPortrait ? 1280 : 720;
+  const idealAspectRatio = viewportIsPortrait ? 9 / 16 : 16 / 9;
+
+  const videoConstraints: MediaTrackConstraints = {
+    facingMode: { ideal: "environment" },
+    width: { ideal: idealWidth },
+    height: { ideal: idealHeight },
+    aspectRatio: { ideal: idealAspectRatio }
+  };
+
+  if (Number.isFinite(targetFramerate) && targetFramerate > 0) {
+    videoConstraints.frameRate = {
+      ideal: targetFramerate,
+      max: targetFramerate
+    };
+  }
+
   return navigator.mediaDevices.getUserMedia({
     audio: false,
-    video: {
-      facingMode: { ideal: "environment" },
-      width: { ideal: 1280 },
-      height: { ideal: 720 }
-    }
+    video: videoConstraints
   });
 }
 

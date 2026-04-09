@@ -4,6 +4,8 @@ services:
       context: ./api
     ports:
       - "8000:8000"
+    environment:
+      - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-5}
     volumes:
       - ./api/app:/app/app
     healthcheck:
