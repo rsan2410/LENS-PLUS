@@ -7,6 +7,7 @@ services:
     environment:
       - SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-0.1}
       - SNAPSHOT_JPEG_QUALITY=${SNAPSHOT_JPEG_QUALITY:-92}
+      - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-5}
     volumes:
       - ./api/app:/app/app
     healthcheck:

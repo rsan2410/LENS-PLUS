@@ -17,13 +17,16 @@ LENS-PLUS is a WebRTC prototype that streams video from a phone or desktop brows
   - `POST /webrtc/ice`
   - `GET /health`
   - `GET /debug/sessions`
+  - `GET /debug/sessions/history`
   - `GET /debug/sessions/{session_id}/latest.jpg`
+  - Per-session frame dump artifacts in `api/app/session_artifacts/`
   - Mock inference events streamed over WebRTC data channel `results`
 
 ## Repository layout
 
 - `web/` frontend app
 - `api/` backend signaling service
+- `api/README.md` backend details + model integration guide
 - `scripts/setup-dev-https.sh` local HTTPS helper for phone camera testing
 - `docker-compose.yml` shared dev setup
 
@@ -48,7 +51,15 @@ Default `.env.example`:
 VITE_SIGNALING_BASE_URL=http://localhost:8000
 SNAPSHOT_INTERVAL_SECONDS=0.1
 SNAPSHOT_JPEG_QUALITY=92
+ANALYSIS_TARGET_FPS=5
 ```
+
+`ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
+
+Optional backend env var:
+
+- `SESSION_ARTIFACTS_DIR` (default: `api/app/session_artifacts` in local dev and `/app/app/session_artifacts` in Docker)
+  - Directory where per-session processed frame dumps and manifest files are written.
 
 For HTTPS + Docker phone testing, use `/api` for signaling and set `VITE_API_PROXY_TARGET=http://api:8000` (the helper script below configures this automatically).
 
@@ -220,3 +231,26 @@ https://<your-dev-machine-ip>:5173/api/debug/sessions/<session_id>/latest.jpg
 ```
 
 Refresh to view updated snapshots from the incoming stream.
+
+5. View persisted session dump history:
+
+```text
+https://<your-dev-machine-ip>:5173/api/debug/sessions/history
+```
+
+Each session artifact stores all processed frames (`frame-*.jpg`) plus `session.json` metadata.
+The artifact path is ignored by git and excluded from API Docker build context.
+
+## Clear session frame artifacts
+
+Use the cleanup helper to remove all stored session dumps and recreate an empty artifact directory:
+
+```bash
+scripts/clean-session-artifacts.sh
+```
+
+You can also pass a custom artifact path:
+
+```bash
+scripts/clean-session-artifacts.sh /tmp/lens-plus-artifacts
+```
