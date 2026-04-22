@@ -52,6 +52,9 @@ FPS_WINDOW_SECONDS = 1.0
 SESSION_MANIFEST_FILENAME = "session.json"
 MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
 
+# grouping frames feature
+GROUP_SESSION_TIME_CUT = 30 # seconds
+
 
 def clamp_analysis_fps(value: float) -> float:
     if not math.isfinite(value):
@@ -625,9 +628,7 @@ def sanitize_artifact_component(value: str) -> str:
     return sanitized or "session"
 
 
-def create_session_artifact(
-    session_id: str, started_at: datetime
-) -> tuple[str | None, Path | None, Path | None, str | None]:
+def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str | None, Path | None, Path | None, str | None]:
     safe_session_id = sanitize_artifact_component(session_id)
     started_fragment = started_at.strftime("%Y%m%dT%H%M%S%fZ")
     artifact_id = f"{started_fragment}--{safe_session_id}"
@@ -636,6 +637,8 @@ def create_session_artifact(
 
     try:
         artifact_dir.mkdir(parents=True, exist_ok=False)
+
+    
     except FileExistsError:
         artifact_id = f"{artifact_id}--{uuid.uuid4().hex[:8]}"
         artifact_dir = SESSION_ARTIFACTS_ROOT / artifact_id
@@ -650,6 +653,23 @@ def create_session_artifact(
     return artifact_id, artifact_dir, artifact_manifest_path, None
 
 
+GROUPED_SECONDS = 30 # should be grouped every 30 seconds
+
+def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime):
+    elapsed_seconds = (frame_at - started_at).total_seconds()
+    group_number = int(elapsed_seconds // GROUPED_SECONDS) + 1
+    group_dir = artifact_dir / f"group-{group_number}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+    return group_dir
+
+def persist_processed_frame(session: Session, frame_jpeg: bytes, frame_at: datetime) -> None:
+    if session.artifact_dir is None:
+        return
+
+    if session.started_at is None:
+        session.last_dump_error = "frame dump failed: session.started_at is missing"
+        session.dump_errors += 1
+        return
 def persist_processed_frame(
     session: Session,
     frame_jpeg: bytes,
@@ -673,10 +693,19 @@ def persist_processed_frame(
     }
 
     try:
+        group_dir = get_group_dir(session.artifact_dir, session.started_at, frame_at)
+
+        frame_name = (
+            f"frame-{session.processed_frames:06d}-"
+            f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
+        )
+        frame_path = group_dir / frame_name
         frame_path.write_bytes(frame_jpeg)
+
         metadata_path.write_text(json.dumps(frame_metadata, indent=2) + "\n")
         session.dumped_frames += 1
         session.last_dump_error = None
+
     except Exception as error:
         session.dump_errors += 1
         session.last_dump_error = f"frame dump failed: {error}"

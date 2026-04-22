@@ -39,7 +39,7 @@ printf "Generating cert for localhost + %s...\n" "$LAN_IP"
 mkcert \
   -key-file "$KEY_FILE" \
   -cert-file "$CERT_FILE" \
-  localhost 127.0.0.1 ::1 "$LAN_IP"
+  localhost 127.0.0.1 "$LAN_IP"
 
 python3 - "$ENV_FILE" <<'PY'
 from pathlib import Path

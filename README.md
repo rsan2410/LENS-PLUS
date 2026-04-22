@@ -2,7 +2,9 @@
 
 Local Environmental Navigation Support +
 
-LENS-PLUS is a WebRTC prototype that streams video from a phone or desktop browser to a FastAPI backend. The backend returns mock guidance events over a WebRTC data channel and exposes debug endpoints to verify frame intake.
+LENS-PLUS is a navigational system for visually impaired users that aims to improve perception of diverse environments with technology such as object detection, semantic segmentation, depth estimation natural language scene generation and live streaming.
+
+A WebRTC prototype streams video from a phone or desktop browser to a FastAPI backend. The backend returns mock guidance events over a WebRTC data channel and exposes debug endpoints to verify frame intake.
 
 ## What is implemented
 
