@@ -5,36 +5,41 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import json
+import statistics
+from time import perf_counter
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DEEPLAB_PATH = os.path.join(BASE_DIR, "DeepLabV3Plus-Pytorch")
-sys.path.insert(0, DEEPLAB_PATH)
+BASE_DIR = Path(__file__).resolve().parent # # LENS-PLUS/models/segmentation/src
+PROJECT_ROOT = BASE_DIR.parents[2] # LENS PLUS
+DEEPLAB_PATH = BASE_DIR / "DeepLabV3Plus-Pytorch"
+sys.path.insert(0, str(DEEPLAB_PATH))
 
 import cv2
 import numpy as np
 import torch
 from torchvision import transforms
 from ultralytics import YOLO
-
 import network
+ 
+
+MODELS_DIR = PROJECT_ROOT / "models"
+APP_DIR = PROJECT_ROOT / "api" / "app"
 
 
-# ==========================================================
-# CONFIG
-# ==========================================================
 
-OUTPUT_DIR = r"D:\Zayaan\D_git\LENS-PLUS\models\segmentation\output"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "segmentation-output"
+JSON_OUTPUT_DIR = OUTPUT_DIR
 
 OUTPUT_WIDTH = 640
 OUTPUT_HEIGHT = 360
 
+FRAME_SIZE = (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+
 MERGE_IDLE_SECONDS = 40
 
 
-# ==========================================================
-# CITYSCAPES ACCESSIBILITY MAPPER
-# ==========================================================
+# CITYSCAPES
 
 class CityscapesAccessibilityMapper:
     def __init__(self):
@@ -88,9 +93,7 @@ class CityscapesAccessibilityMapper:
         return (preds == 7).astype(np.uint8)
 
 
-# ==========================================================
-# SEGMENTATION + NAVIGATION
-# ==========================================================
+# segmentation and navigation
 
 class ImprovedSegmentation:
     def __init__(
@@ -118,7 +121,7 @@ class ImprovedSegmentation:
         self.transform = transforms.Compose(
             [
                 transforms.ToPILImage(),
-                transforms.Resize((512, 512)),
+                transforms.Resize((360, 640)),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406],
@@ -127,9 +130,113 @@ class ImprovedSegmentation:
             ]
         )
 
-    # ------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------
+
+    def get_model_size_mb(self):
+        total_params = sum(p.numel() for p in self.deeplab_model.parameters())
+        total_bytes = total_params * 4
+        return round(total_bytes / (1024 * 1024), 2)
+
+
+    def binary_iou(self, pred, target):
+        inter = np.logical_and(pred, target).sum()
+        union = np.logical_or(pred, target).sum()
+
+        if union == 0:
+            return 1.0
+
+        return float(inter / union)
+
+
+    def dice_score(self, pred, target):
+        inter = np.logical_and(pred, target).sum()
+        denom = pred.sum() + target.sum()
+
+        if denom == 0:
+            return 1.0
+
+        return float((2 * inter) / denom)
+
+
+    def focal_loss_binary(self, pred, target, gamma=2.0, alpha=0.25):
+        eps = 1e-6
+
+        p = pred.astype(np.float32)
+        t = target.astype(np.float32)
+
+        p = np.clip(p, eps, 1 - eps)
+
+        loss_pos = -alpha * t * ((1 - p) ** gamma) * np.log(p)
+        loss_neg = -(1 - alpha) * (1 - t) * (p ** gamma) * np.log(1 - p)
+
+        return float(np.mean(loss_pos + loss_neg))
+
+
+    def mean_surface_distance(self, pred, target):
+        pred_pts = np.column_stack(np.where(pred > 0))
+        gt_pts = np.column_stack(np.where(target > 0))
+
+        if len(pred_pts) == 0 or len(gt_pts) == 0:
+            return 0.0
+
+        dists = []
+
+        sample_pred = pred_pts[::max(1, len(pred_pts) // 200)]
+        sample_gt = gt_pts[::max(1, len(gt_pts) // 200)]
+
+        for p in sample_pred:
+            diff = sample_gt - p
+            dist = np.sqrt((diff ** 2).sum(axis=1)).min()
+            dists.append(dist)
+
+        return float(np.mean(dists))
+
+
+    def calculate_group_metrics(
+        self,
+        ious,
+        inference_times,
+        focal_losses,
+        dices,
+        msds
+    ):
+        if not ious:
+            return {}
+
+        miou = float(np.mean(ious))
+
+        metrics = {
+            "mIOU": round(miou, 4),
+            "IOU_distribution": {
+                "min": round(float(min(ious)), 4),
+                "max": round(float(max(ious)), 4),
+                "mean": round(float(np.mean(ious)), 4),
+                "median": round(float(statistics.median(ious)), 4),
+            },
+            "focal_loss": round(float(np.mean(focal_losses)), 6),
+            "mAP": round(float(np.mean(ious)), 4),
+            "inference_time_ms": round(float(np.mean(inference_times)), 2),
+            "model_size_mb": self.get_model_size_mb(),
+            "Dice_Similarity_Coefficient": round(float(np.mean(dices)), 4),
+            "Jaccard_Index": round(float(np.mean(ious)), 4),
+            "Mean_Surface_Distance": round(float(np.mean(msds)), 4),
+        }
+
+        return metrics
+
+
+    def save_group_json(
+        self,
+        artifact_name,
+        group_name,
+        metrics
+    ):
+        os.makedirs(JSON_OUTPUT_DIR, exist_ok=True)
+
+        path = Path(JSON_OUTPUT_DIR) / f"{artifact_name}_{group_name}.json"
+
+        with open(path, "w") as f:
+            json.dump(metrics, f, indent=2)
+
 
     def natural_key(self, path):
         return [
@@ -173,9 +280,7 @@ class ImprovedSegmentation:
         frames.sort(key=self.natural_key)
         return frames
 
-    # ------------------------------------------------------
-    # MODEL LOADING
-    # ------------------------------------------------------
+    # loading the model
 
     def load_deeplab(self, path):
         model = network.modeling.__dict__["deeplabv3plus_mobilenet"](
@@ -237,11 +342,8 @@ class ImprovedSegmentation:
 
         preds = outputs.max(1)[1].cpu().numpy()[0]
 
-        preds = cv2.resize(
-            preds.astype(np.uint8),
-            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        preds = preds.astype(np.uint8)
+        preds = cv2.resize(preds, FRAME_SIZE[::-1], interpolation=cv2.INTER_NEAREST)
 
         return preds
 
@@ -365,9 +467,7 @@ class ImprovedSegmentation:
             tipLength=0.25,
         )
 
-    # ------------------------------------------------------
-    # VISUALIZATION
-    # ------------------------------------------------------
+    # visualization
 
     def create_visualization(
         self,
@@ -380,14 +480,11 @@ class ImprovedSegmentation:
     ):
         if yolo_results is not None:
             overlay = yolo_results[0].plot()
-            overlay = cv2.resize(
-                overlay,
-                (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-            )
+            overlay = self.preprocess_frame(overlay)
         else:
             overlay = image.copy()
 
-        overlay = overlay.astype(np.float32)
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
 
         green = np.zeros_like(overlay)
         green[:] = [0, 255, 0]
@@ -402,6 +499,9 @@ class ImprovedSegmentation:
         cyan[:] = [255, 255, 0]
 
         def blend(base, mask, color, alpha):
+            if mask.shape[:2] != base.shape[:2]:
+                mask = cv2.resize(mask.astype(np.uint8), (base.shape[1], base.shape[0]), interpolation=cv2.INTER_NEAREST)
+
             mask3 = np.stack([mask, mask, mask], axis=2)
 
             return np.where(
@@ -449,14 +549,18 @@ class ImprovedSegmentation:
 
         return overlay
 
-    # ------------------------------------------------------
-    # GROUP PROCESSING
-    # ------------------------------------------------------
+
+    def preprocess_frame(self, frame):
+        frame = cv2.resize(frame, (FRAME_SIZE[0], FRAME_SIZE[1]))
+        return frame
+    
 
     def process_group(
         self,
         frame_paths,
-        output_path
+        output_path,
+        artifact_name,
+        group_name
     ):
         if not frame_paths:
             return
@@ -464,10 +568,11 @@ class ImprovedSegmentation:
         self.prev_walkable_mask = None
         self.prev_hazard_mask = None
 
-        fps = self.infer_real_fps(frame_paths)
-
+        fps = self.target_fps
+        
+        
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
+        
         out = cv2.VideoWriter(
             str(output_path),
             fourcc,
@@ -476,12 +581,18 @@ class ImprovedSegmentation:
         )
 
         if not out.isOpened():
-            raise RuntimeError(
-                f"Could not open writer {output_path}"
-            )
+            raise RuntimeError(f"Could not open writer {output_path}")
 
         processed_count = 0
         segmentation_cache = None
+
+        ious = []
+        inference_times = []
+        focal_losses = []
+        dices = []
+        msds = []
+
+        previous_walkable = None
 
         for frame_path in frame_paths:
 
@@ -490,10 +601,7 @@ class ImprovedSegmentation:
             if frame is None:
                 continue
 
-            frame = cv2.resize(
-                frame,
-                (OUTPUT_WIDTH, OUTPUT_HEIGHT)
-            )
+            frame = self.preprocess_frame(frame)
 
             if self.use_yolo:
                 yolo_results = self.yolo_model(
@@ -504,11 +612,16 @@ class ImprovedSegmentation:
             else:
                 yolo_results = None
 
+            t0 = perf_counter()
+
             if processed_count % self.deeplab_every_n_frames == 0:
                 semantic = self.get_semantic_predictions(frame)
                 segmentation_cache = semantic
             else:
                 semantic = segmentation_cache
+
+            infer_ms = (perf_counter() - t0) * 1000
+            inference_times.append(infer_ms)
 
             walkable = self.mapper.get_walkable_mask(semantic)
             hazard = self.mapper.get_hazard_mask(semantic)
@@ -525,6 +638,23 @@ class ImprovedSegmentation:
                 self.prev_hazard_mask,
             )
 
+            if previous_walkable is not None:
+                iou = self.binary_iou(walkable, previous_walkable)
+                dice = self.dice_score(walkable, previous_walkable)
+                fl = self.focal_loss_binary(
+                    walkable.astype(np.float32),
+                    previous_walkable.astype(np.float32),
+                )
+                msd = self.mean_surface_distance(
+                    walkable,
+                    previous_walkable
+                )
+
+                ious.append(iou)
+                dices.append(dice)
+                focal_losses.append(fl)
+                msds.append(msd)
+
             viz = self.create_visualization(
                 frame,
                 yolo_results,
@@ -538,14 +668,27 @@ class ImprovedSegmentation:
 
             self.prev_walkable_mask = walkable
             self.prev_hazard_mask = hazard
+            previous_walkable = walkable.copy()
 
             processed_count += 1
 
         out.release()
 
-    # ------------------------------------------------------
-    # MERGE VIDEOS
-    # ------------------------------------------------------
+        metrics = self.calculate_group_metrics(
+            ious,
+            inference_times,
+            focal_losses,
+            dices,
+            msds,
+        )
+
+        self.save_group_json(
+            artifact_name,
+            group_name,
+            metrics
+        )
+    
+    # merge videos
 
     def merge_group_videos(
         self,
@@ -595,13 +738,7 @@ class ImprovedSegmentation:
                 if frame is None:
                     continue
 
-                frame = cv2.resize(
-                    frame,
-                    (
-                        OUTPUT_WIDTH,
-                        OUTPUT_HEIGHT,
-                    )
-                )
+                frame = self.preprocess_frame(frame)
 
                 out.write(frame)
 
@@ -611,105 +748,100 @@ class ImprovedSegmentation:
 
         print("Merged:", final_path)
 
-    # ------------------------------------------------------
-    # MAIN LOOP
-    # ------------------------------------------------------
+
+    def merge_two_videos(self, video1, video2, output_path):
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+
+        out = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            self.target_fps,
+            FRAME_SIZE,
+        )
+
+        def copy(video):
+            cap = cv2.VideoCapture(str(video))
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = self.preprocess_frame(frame)
+                out.write(frame)
+            cap.release()
+
+        copy(video1)
+        copy(video2)
+
+        out.release()
+
+    # main
 
     def run(self):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        processed_groups = set()
-
-        last_new_group_time = time.time()
-        last_merged_count = 0
+        processed_pairs = 0
+        known_groups = []
 
         while True:
+            try:
+                artifact = self.find_latest_artifact()
+                groups = self.get_group_folders(artifact)
 
-            artifact = self.find_latest_artifact()
-            groups = self.get_group_folders(artifact)
+                group_names = [g.name for g in groups]
 
-            new_group_found = False
+                if group_names != known_groups:
+                    print("Watching...")
+                    print("Groups:", group_names)
+                    known_groups = group_names
 
-            for group in groups:
+                # process in pairs
+                while len(groups) >= (processed_pairs * 2 + 2):
 
-                key = f"{artifact.name}_{group.name}"
+                    i = processed_pairs * 2
 
-                if key in processed_groups:
-                    continue
+                    g1 = groups[i]
+                    g2 = groups[i + 1]
 
-                frame_paths = self.load_frame_paths(group)
+                    print(f"Processing pair: {g1.name}, {g2.name}")
 
-                if not frame_paths:
-                    continue
+                    temp1 = Path(OUTPUT_DIR) / f"temp_{g1.name}.mp4"
+                    temp2 = Path(OUTPUT_DIR) / f"temp_{g2.name}.mp4"
 
-                print("Processing:", group)
-
-                output_path = Path(OUTPUT_DIR) / (
-                    f"{key}.mp4"
-                )
-
-                try:
+                    # process each group individually
                     self.process_group(
-                        frame_paths,
-                        output_path,
+                        self.load_frame_paths(g1),
+                        temp1,
+                        artifact.name,
+                        g1.name
                     )
 
-                    processed_groups.add(key)
-                    new_group_found = True
-
-                except Exception as error:
-                    print(
-                        "Group failed:",
-                        group,
-                        error,
+                    self.process_group(
+                        self.load_frame_paths(g2),
+                        temp2,
+                        artifact.name,
+                        g2.name
                     )
 
-            if new_group_found:
-                last_new_group_time = time.time()
+                    # merge pair
+                    self.merge_two_videos(
+                        temp1,
+                        temp2,
+                        Path(OUTPUT_DIR) / f"final_{processed_pairs + 1}.mp4"
+                    )
 
-            idle = time.time() - last_new_group_time
+                    processed_pairs += 1
 
-            current_count = len(processed_groups)
+            except FileNotFoundError:
+                print("No artifacts found")
 
-            if (
-                idle >= MERGE_IDLE_SECONDS
-                and current_count > 0
-                and current_count != last_merged_count
-            ):
-                self.merge_group_videos(
-                    artifact.name
-                )
-
-                last_merged_count = current_count
-
-                print("Session complete.")
-                break
-
-            time.sleep(2)
-
-
-# ==========================================================
-# ENTRY
-# ==========================================================
+            time.sleep(1)
 
 if __name__ == "__main__":
     model = ImprovedSegmentation(
-        frames_root=os.path.abspath(
-            os.path.join(
-                BASE_DIR,
-                "..",
-                "..",
-                "..",
-                "api",
-                "app",
-                "session_artifacts",
-            )
-        ),
+        frames_root=f"{APP_DIR}/session_artifacts",
         yolo_model_path="yolov8n-seg.pt",
-        deeplab_model_path=os.path.join(
-            BASE_DIR,
-            "deeplabv3plus-mobilenet.pth",
-        ),
+        deeplab_model_path="deeplabv3plus-mobilenet.pth",
         target_fps=5,
         use_yolo=True,
         deeplab_every_n_frames=2,
