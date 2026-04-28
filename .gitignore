@@ -17,3 +17,7 @@ web/certs/
 
 # Runtime artifacts
 api/app/session_artifacts/
+
+yolov8n-seg.pt
+models/segmentation/src/python
+models/segmentation/output/improved_segmented_video.mp4
