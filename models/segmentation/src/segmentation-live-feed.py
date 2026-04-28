@@ -22,22 +22,16 @@ from torchvision import transforms
 from ultralytics import YOLO
 import network
  
-
 MODELS_DIR = PROJECT_ROOT / "models"
 APP_DIR = PROJECT_ROOT / "api" / "app"
 
-
-
-OUTPUT_DIR = PROJECT_ROOT / "models" / "segmentation-output"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "segmentation" / "output"
 JSON_OUTPUT_DIR = OUTPUT_DIR
 
 OUTPUT_WIDTH = 640
 OUTPUT_HEIGHT = 360
 
 FRAME_SIZE = (OUTPUT_WIDTH, OUTPUT_HEIGHT)
-
-MERGE_IDLE_SECONDS = 40
-
 
 # CITYSCAPES
 
@@ -477,6 +471,7 @@ class ImprovedSegmentation:
         hazard,
         dynamic,
         signs,
+        nav=None
     ):
         if yolo_results is not None:
             overlay = yolo_results[0].plot()
@@ -517,11 +512,8 @@ class ImprovedSegmentation:
 
         overlay = overlay.astype(np.uint8)
 
-        nav = self.analyze_navigation(
-            walkable,
-            hazard,
-            dynamic,
-        )
+        if nav is None:
+            nav = self.analyze_navigation(walkable, hazard, dynamic)
 
         self.draw_navigation_arrow(
             overlay,
@@ -612,6 +604,22 @@ class ImprovedSegmentation:
             else:
                 yolo_results = None
 
+            detections = []
+
+            if yolo_results and yolo_results[0].boxes is not None:
+                for box in yolo_results[0].boxes:
+                    xyxy = box.xyxy[0].tolist()
+                    conf = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    label = self.yolo_model.names[cls_id]
+                    detections.append({
+                        "label": label,
+                        "confidence": round(conf, 3),
+                        "xyxy": [round(v, 1) for v in xyxy]
+                    })
+            sidecar_path = frame_path.with_suffix(".detections.json")
+            sidecar_path.write_text(json.dumps({"detections": detections}, indent=2))
+
             t0 = perf_counter()
 
             if processed_count % self.deeplab_every_n_frames == 0:
@@ -655,6 +663,8 @@ class ImprovedSegmentation:
                 focal_losses.append(fl)
                 msds.append(msd)
 
+            nav = self.analyze_navigation(walkable, hazard, dynamic)
+
             viz = self.create_visualization(
                 frame,
                 yolo_results,
@@ -662,9 +672,28 @@ class ImprovedSegmentation:
                 hazard,
                 dynamic,
                 signs,
+                nav
             )
 
             out.write(viz)
+
+            nav_sidecar = frame_path.with_suffix(".navigation.json")
+            nav_sidecar.write_text(json.dumps({
+                "walkable_status": nav["status"],
+                "direction": nav["direction"],
+                "zone_scores": {
+                    k: round(float(v), 2) for k, v in nav["scores"].items()
+                },
+                "walkable_pixel_ratio": round(
+                    float(np.sum(walkable)) / walkable.size, 4
+                ),
+                "hazard_pixel_ratio": round(
+                    float(np.sum(hazard)) / hazard.size, 4
+                ),
+                "dynamic_obstacle_ratio": round(
+                    float(np.sum(dynamic)) / dynamic.size, 4
+                ),
+            }, indent=2))
 
             self.prev_walkable_mask = walkable
             self.prev_hazard_mask = hazard
@@ -690,98 +719,41 @@ class ImprovedSegmentation:
     
     # merge videos
 
-    def merge_group_videos(
-        self,
-        artifact_name
-    ):
+    def merge_group_videos(self, artifact_name: str, group_keys: list, batch_num: int):
         output_dir = Path(OUTPUT_DIR)
-
-        mp4s = list(
-            output_dir.glob(
-                f"{artifact_name}_group-*.mp4"
-            )
-        )
-
+        mp4s = [output_dir / f"{k}.mp4" for k in group_keys if (output_dir / f"{k}.mp4").exists()]
         if not mp4s:
             return
 
-        mp4s.sort(key=self.natural_key)
-
-        final_path = output_dir / (
-            f"{artifact_name}_FINAL.mp4"
-        )
-
+        demo_path = output_dir / f"{artifact_name}_demo_{batch_num}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(str(demo_path), fourcc, self.target_fps, FRAME_SIZE)
 
-        out = cv2.VideoWriter(
-            str(final_path),
-            fourcc,
-            self.target_fps,
-            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-        )
-
-        if not out.isOpened():
-            raise RuntimeError(
-                f"Cannot create {final_path}"
-            )
-
-        for video in mp4s:
-
-            cap = cv2.VideoCapture(str(video))
-
-            while True:
-                ret, frame = cap.read()
-
-                if not ret:
-                    break
-
-                if frame is None:
-                    continue
-
-                frame = self.preprocess_frame(frame)
-
-                out.write(frame)
-
-            cap.release()
-
-        out.release()
-
-        print("Merged:", final_path)
-
-
-    def merge_two_videos(self, video1, video2, output_path):
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
-
-        out = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            self.target_fps,
-            FRAME_SIZE,
-        )
-
-        def copy(video):
-            cap = cv2.VideoCapture(str(video))
+        for mp4 in mp4s:
+            cap = cv2.VideoCapture(str(mp4))
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 frame = self.preprocess_frame(frame)
                 out.write(frame)
             cap.release()
 
-        copy(video1)
-        copy(video2)
-
         out.release()
+        print(f"  Segmentation Demos: {demo_path.name}  ({len(mp4s)} groups)")
 
     # main
 
     def run(self):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        processed_pairs = 0
+        processed_groups = set()
+        processed_order = []
+        demo_batch_num = 1
+        last_merged_count = 0
         known_groups = []
+
+        DEMO_BATCH_SIZE = 3
 
         while True:
             try:
@@ -789,60 +761,75 @@ class ImprovedSegmentation:
                 groups = self.get_group_folders(artifact)
 
                 group_names = [g.name for g in groups]
-
                 if group_names != known_groups:
                     print("Watching...")
                     print("Groups:", group_names)
                     known_groups = group_names
 
-                # process in pairs
-                while len(groups) >= (processed_pairs * 2 + 2):
+                is_closed = False
+                manifest_path = artifact / "session.json"
+                if manifest_path.exists():
+                    try:
+                        manifest_data = json.loads(manifest_path.read_text())
+                        if manifest_data.get("closed_at") is not None:
+                            is_closed = True
+                    except Exception:
+                        pass
 
-                    i = processed_pairs * 2
+                if is_closed:
+                    safe_groups = groups
+                else:
+                    safe_groups = groups[:-1] if len(groups) > 1 else []
 
-                    g1 = groups[i]
-                    g2 = groups[i + 1]
+                for group in safe_groups:
+                    key = f"{artifact.name}_{group.name}"
+                    if key in processed_groups:
+                        continue
 
-                    print(f"Processing pair: {g1.name}, {g2.name}")
+                    frame_paths = self.load_frame_paths(group)
+                    if not frame_paths:
+                        continue
 
-                    temp1 = Path(OUTPUT_DIR) / f"temp_{g1.name}.mp4"
-                    temp2 = Path(OUTPUT_DIR) / f"temp_{g2.name}.mp4"
+                    print(f"  [Segmentation] Processing: {group.name}")
 
-                    # process each group individually
+                    video_path = Path(OUTPUT_DIR) / f"{key}.mp4"
+
                     self.process_group(
-                        self.load_frame_paths(g1),
-                        temp1,
+                        frame_paths,
+                        video_path,
                         artifact.name,
-                        g1.name
+                        group.name,
                     )
 
-                    self.process_group(
-                        self.load_frame_paths(g2),
-                        temp2,
-                        artifact.name,
-                        g2.name
-                    )
+                    processed_groups.add(key)
+                    processed_order.append(key)
+                    print(f"  Done: {group.name}")
 
-                    # merge pair
-                    self.merge_two_videos(
-                        temp1,
-                        temp2,
-                        Path(OUTPUT_DIR) / f"final_{processed_pairs + 1}.mp4"
-                    )
-
-                    processed_pairs += 1
+                unmerged_count = len(processed_order) - last_merged_count
+                if unmerged_count >= DEMO_BATCH_SIZE:
+                    batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
+                    self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
+                    last_merged_count += DEMO_BATCH_SIZE
+                    demo_batch_num += 1
+                
+                elif is_closed and unmerged_count > 0:
+                    print(f"Flushing final {unmerged_count} leftover groups into a demo...")
+                    batch_keys = processed_order[last_merged_count:]
+                    self._merge_demo(artifact.name, batch_keys, demo_batch_num)
+                    last_merged_count += unmerged_count
+                    demo_batch_num += 1
 
             except FileNotFoundError:
                 print("No artifacts found")
 
-            time.sleep(1)
+            time.sleep(0.5)
 
 if __name__ == "__main__":
     model = ImprovedSegmentation(
         frames_root=f"{APP_DIR}/session_artifacts",
-        yolo_model_path="yolov8n-seg.pt",
-        deeplab_model_path="deeplabv3plus-mobilenet.pth",
-        target_fps=5,
+        yolo_model_path=str(BASE_DIR / "yolov8n-seg.pt"),
+        deeplab_model_path=str(BASE_DIR / "deeplabv3plus-mobilenet.pth"),
+        target_fps=10,
         use_yolo=True,
         deeplab_every_n_frames=2,
     )
