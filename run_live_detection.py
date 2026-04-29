@@ -82,6 +82,17 @@ def parse_args() -> argparse.Namespace:
         default=0.03,
         help="Poll interval for snapshot feed in seconds (default: 0.03).",
     )
+    parser.add_argument(
+        "--no-wait-for-feed",
+        action="store_true",
+        help="Do not keep retrying when no active live feed is available at startup.",
+    )
+    parser.add_argument(
+        "--feed-retry-interval",
+        type=float,
+        default=1.0,
+        help="Retry interval in seconds while waiting for live feed discovery (default: 1.0).",
+    )
     return parser.parse_args()
 
 
@@ -340,6 +351,28 @@ def make_source(args: argparse.Namespace, project_root: Path) -> FrameSource:
     return SnapshotHttpSource(choice.snapshot_url, poll_interval=args.poll_interval)
 
 
+def open_source_with_retry(args: argparse.Namespace, project_root: Path) -> FrameSource:
+    if args.source or args.no_wait_for_feed:
+        return make_source(args, project_root)
+
+    retry_interval = max(0.2, float(args.feed_retry_interval))
+    print("[INFO] Waiting for live phone feed/session. Press Ctrl+C to cancel.")
+    last_log_at = 0.0
+    last_error: str | None = None
+
+    while True:
+        try:
+            return make_source(args, project_root)
+        except Exception as exc:
+            message = str(exc).strip()
+            now = time.monotonic()
+            if message != last_error or (now - last_log_at) >= 2.0:
+                print(f"[WAIT] {message}")
+                last_log_at = now
+                last_error = message
+            time.sleep(retry_interval)
+
+
 def draw_box_with_label(
     frame: np.ndarray, box: tuple[int, int, int, int], label: str, color: tuple[int, int, int]
 ) -> None:
@@ -375,7 +408,10 @@ def main() -> int:
     project_root = Path(__file__).resolve().parent
 
     try:
-        source = make_source(args, project_root)
+        source = open_source_with_retry(args, project_root)
+    except KeyboardInterrupt:
+        print("\n[INFO] Waiting cancelled by user.")
+        return 0
     except Exception as exc:
         print(f"[ERROR] {exc}")
         return 1

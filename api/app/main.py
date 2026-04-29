@@ -18,7 +18,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
 
@@ -686,7 +686,22 @@ def build_detection_context_for_frame(
     payload = session.latest_inference_payload
     inference_at = session.latest_inference_at
     if payload is None or inference_at is None:
-        return None
+        return {
+            "inference_timestamp": None,
+            "server_inference_received_at": None,
+            "age_ms": None,
+            "is_stale": True,
+            "scene_summary": None,
+            "guidance_text": None,
+            "objects": [],
+            "metrics": {
+                "num_detections": 0,
+                "num_with_confidence": 0,
+                "avg_confidence": None,
+                "max_confidence": None,
+                "min_confidence": None,
+            },
+        }
 
     objects = normalize_inference_objects(payload)
     confidences = [
@@ -818,6 +833,172 @@ def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime) 
     return group_dir
 
 
+def coerce_bbox_list(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+
+    parsed: list[float] = []
+    for item in value:
+        if not isinstance(item, (int, float)) or not math.isfinite(item):
+            return None
+        parsed.append(float(item))
+    return parsed
+
+
+def clamp_pixel(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def bbox_to_xyxy_pixels(
+    bbox: list[float], image_width: int, image_height: int
+) -> tuple[int, int, int, int] | None:
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    x, y, width, height = bbox
+
+    if all(0.0 <= value <= 1.0 for value in bbox):
+        left = int(round(x * image_width))
+        top = int(round(y * image_height))
+        right = int(round((x + width) * image_width))
+        bottom = int(round((y + height) * image_height))
+    else:
+        if width > x and height > y:
+            left = int(round(x))
+            top = int(round(y))
+            right = int(round(width))
+            bottom = int(round(height))
+        else:
+            left = int(round(x))
+            top = int(round(y))
+            right = int(round(x + width))
+            bottom = int(round(y + height))
+
+    max_x = max(0, image_width - 1)
+    max_y = max(0, image_height - 1)
+    left = clamp_pixel(left, 0, max_x)
+    top = clamp_pixel(top, 0, max_y)
+    right = clamp_pixel(right, 0, max_x)
+    bottom = clamp_pixel(bottom, 0, max_y)
+
+    if right <= left or bottom <= top:
+        return None
+
+    return left, top, right, bottom
+
+
+def select_primary_detected_object(
+    detected_objects: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not detected_objects:
+        return None
+
+    best_object = detected_objects[0]
+    best_confidence = (
+        best_object.get("confidence")
+        if isinstance(best_object.get("confidence"), float)
+        else -1.0
+    )
+    for candidate in detected_objects[1:]:
+        confidence = candidate.get("confidence")
+        if isinstance(confidence, float) and confidence > best_confidence:
+            best_object = candidate
+            best_confidence = confidence
+
+    return best_object
+
+
+def render_detection_overlay(
+    frame_jpeg: bytes,
+    detection_context: dict[str, Any] | None,
+) -> tuple[bytes, list[dict[str, Any]], str | None]:
+    if not isinstance(detection_context, dict):
+        return frame_jpeg, [], None
+
+    raw_objects = detection_context.get("objects")
+    if not isinstance(raw_objects, list) or not raw_objects:
+        return frame_jpeg, [], None
+
+    parsed_objects: list[dict[str, Any]] = []
+    for raw_obj in raw_objects:
+        if not isinstance(raw_obj, dict):
+            continue
+        label = raw_obj.get("label")
+        if not isinstance(label, str):
+            continue
+        confidence = raw_obj.get("confidence")
+        confidence_value = None
+        if isinstance(confidence, (int, float)) and math.isfinite(confidence):
+            confidence_value = float(confidence)
+        parsed_objects.append(
+            {
+                "label": label,
+                "confidence": confidence_value,
+                "bbox": coerce_bbox_list(raw_obj.get("bbox")),
+            }
+        )
+
+    if not parsed_objects:
+        return frame_jpeg, [], None
+
+    try:
+        image = Image.open(io.BytesIO(frame_jpeg)).convert("RGB")
+    except Exception as error:
+        return frame_jpeg, parsed_objects, f"overlay decode failed: {error}"
+
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    image_width, image_height = image.size
+    draw_color = (0, 220, 90)
+    drawn_any_box = False
+
+    for obj in parsed_objects:
+        bbox = obj.get("bbox")
+        if not isinstance(bbox, list):
+            continue
+
+        pixel_box = bbox_to_xyxy_pixels(bbox, image_width=image_width, image_height=image_height)
+        if pixel_box is None:
+            continue
+
+        x1, y1, x2, y2 = pixel_box
+        draw.rectangle((x1, y1, x2, y2), outline=draw_color, width=3)
+        confidence = obj.get("confidence")
+        if isinstance(confidence, float):
+            text = f"{obj['label']} {confidence:.2f}"
+        else:
+            text = obj["label"]
+
+        try:
+            text_left, text_top, text_right, text_bottom = draw.textbbox((0, 0), text, font=font)
+            text_width = max(1, text_right - text_left)
+            text_height = max(1, text_bottom - text_top)
+        except Exception:
+            text_width = max(1, int(len(text) * 7))
+            text_height = 12
+
+        text_x = x1
+        text_y = y1 - text_height - 6
+        if text_y < 0:
+            text_y = min(image_height - text_height - 1, y1 + 3)
+
+        bg_right = min(image_width - 1, text_x + text_width + 6)
+        bg_bottom = min(image_height - 1, text_y + text_height + 4)
+        draw.rectangle((text_x, text_y, bg_right, bg_bottom), fill=draw_color)
+        draw.text((text_x + 3, text_y + 1), text, fill=(0, 0, 0), font=font)
+        drawn_any_box = True
+
+    if not drawn_any_box:
+        return frame_jpeg, parsed_objects, None
+
+    try:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=SNAPSHOT_JPEG_QUALITY)
+        return buffer.getvalue(), parsed_objects, None
+    except Exception as error:
+        return frame_jpeg, parsed_objects, f"overlay encode failed: {error}"
+
+
 def persist_processed_frame(
     session: Session,
     frame_jpeg: bytes,
@@ -842,6 +1023,11 @@ def persist_processed_frame(
     metadata_path = frame_path.with_suffix(".json")
     elapsed_seconds = max(0.0, (frame_at - session.started_at).total_seconds())
     group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1
+    rendered_frame_jpeg, detected_objects, overlay_error = render_detection_overlay(
+        frame_jpeg=frame_jpeg,
+        detection_context=detection_context,
+    )
+    object_detected = select_primary_detected_object(detected_objects)
     frame_metadata = {
         "frame_id": session.processed_frames,
         "frame_name": frame_name,
@@ -851,18 +1037,13 @@ def persist_processed_frame(
         "group_dir": group_dir.name,
         "directional": directional_context,
         "detections": detection_context,
+        "object-detected": object_detected,
     }
+    if overlay_error is not None:
+        frame_metadata["detection_overlay_error"] = overlay_error
 
     try:
-        group_dir = get_group_dir(session.artifact_dir, session.started_at, frame_at)
-
-        frame_name = (
-            f"frame-{session.processed_frames:06d}-"
-            f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
-        )
-        frame_path = group_dir / frame_name
-        frame_path.write_bytes(frame_jpeg)
-
+        frame_path.write_bytes(rendered_frame_jpeg)
         metadata_path.write_text(json.dumps(frame_metadata, indent=2) + "\n")
         session.dumped_frames += 1
         session.last_dump_error = None
