@@ -45,6 +45,13 @@ class IceResponse(BaseModel):
     ok: bool
 
 
+class InferenceIngestRequest(BaseModel):
+    timestamp: str | None = None
+    guidance_text: str | None = None
+    scene_summary: str | None = None
+    objects: list[dict[str, Any]] = []
+
+
 DEFAULT_ANALYSIS_TARGET_FPS = 15.0
 MIN_ANALYSIS_TARGET_FPS = 1.0
 MAX_ANALYSIS_TARGET_FPS = 30.0
@@ -455,6 +462,35 @@ async def ice(payload: IceRequest) -> IceResponse:
         raise HTTPException(
             status_code=400, detail=f"Invalid ICE candidate: {error}"
         ) from error
+
+    return IceResponse(ok=True)
+
+
+@app.post("/debug/sessions/{session_id}/inference", response_model=IceResponse)
+async def ingest_inference(
+    session_id: str,
+    payload: InferenceIngestRequest,
+) -> IceResponse:
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Unknown session")
+
+    normalized_payload = {
+        "timestamp": payload.timestamp or datetime.now(timezone.utc).isoformat(),
+        "guidance_text": payload.guidance_text,
+        "scene_summary": payload.scene_summary,
+        "objects": payload.objects,
+    }
+
+    update_latest_inference(session=session, payload=normalized_payload)
+    session.inference_messages_emitted += 1
+    session.updated_at = datetime.now(timezone.utc)
+
+    # If external detections are being ingested, stop mock updates to avoid
+    # overwriting real detection state used by artifact dumps.
+    if session.mock_task is not None:
+        session.mock_task.cancel()
+        session.mock_task = None
 
     return IceResponse(ok=True)
 
