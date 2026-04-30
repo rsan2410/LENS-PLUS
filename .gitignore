@@ -22,3 +22,5 @@ yolov8n-seg.pt
 yolo11s.pt
 models/segmentation/src/python
 models/segmentation/output/improved_segmented_video.mp4
+
+models/segmentation/src/deeplabv3plus-mobilenet.pth
