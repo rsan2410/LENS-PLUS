@@ -26,7 +26,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -167,6 +167,52 @@ class SessionChoice:
     api_base: str
     session_id: str
     snapshot_url: str
+
+
+@dataclass
+class InferencePublishTarget:
+    api_base: str
+    session_id: str
+
+
+class InferencePublisher:
+    def __init__(
+        self,
+        api_base: str,
+        session_id: str,
+        min_interval_seconds: float = 0.1,
+    ) -> None:
+        self.api_base = api_base.rstrip("/")
+        self.session_id = session_id
+        self.min_interval_seconds = max(0.03, min_interval_seconds)
+        self.publish_url = (
+            f"{self.api_base}/debug/sessions/{self.session_id}/inference"
+        )
+        self.http = requests.Session()
+        self.last_sent_at = 0.0
+        self.last_warn_at = 0.0
+
+    def publish(self, payload: dict[str, Any]) -> None:
+        now = time.monotonic()
+        if now - self.last_sent_at < self.min_interval_seconds:
+            return
+        self.last_sent_at = now
+        try:
+            response = self.http.post(
+                self.publish_url,
+                json=payload,
+                timeout=2.5,
+                verify=should_verify_tls(self.publish_url),
+            )
+            if response.status_code >= 300:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:180]}")
+        except Exception as exc:
+            if now - self.last_warn_at >= 2.0:
+                print(f"[WARN] Failed to publish inference: {exc}")
+                self.last_warn_at = now
+
+    def close(self) -> None:
+        self.http.close()
 
 
 def choose_session_id(sessions: list[dict[str, Any]], requested: str | None) -> str:
@@ -373,6 +419,99 @@ def open_source_with_retry(args: argparse.Namespace, project_root: Path) -> Fram
             time.sleep(retry_interval)
 
 
+def discover_with_retry(
+    args: argparse.Namespace, project_root: Path
+) -> SessionChoice:
+    retry_interval = max(0.2, float(args.feed_retry_interval))
+    print("[INFO] Waiting for live phone feed/session. Press Ctrl+C to cancel.")
+    last_log_at = 0.0
+    last_error: str | None = None
+
+    while True:
+        try:
+            return discover_existing_live_feed(
+                project_root=project_root,
+                api_base_override=args.api_base,
+                session_id=args.session_id,
+            )
+        except Exception as exc:
+            message = str(exc).strip()
+            now = time.monotonic()
+            if message != last_error or (now - last_log_at) >= 2.0:
+                print(f"[WAIT] {message}")
+                last_log_at = now
+                last_error = message
+            time.sleep(retry_interval)
+
+
+def resolve_publish_target(
+    args: argparse.Namespace, project_root: Path
+) -> InferencePublishTarget | None:
+    if args.source:
+        if args.api_base and args.session_id:
+            return InferencePublishTarget(
+                api_base=args.api_base.rstrip("/"),
+                session_id=args.session_id,
+            )
+        return None
+
+    if args.no_wait_for_feed:
+        choice = discover_existing_live_feed(
+            project_root=project_root,
+            api_base_override=args.api_base,
+            session_id=args.session_id,
+        )
+    else:
+        choice = discover_with_retry(args, project_root)
+    print("[INFO] Detected existing live feed from this repo:")
+    print(f"       API base: {choice.api_base}")
+    print(f"       session_id: {choice.session_id}")
+    print(f"       snapshot: {choice.snapshot_url}")
+    return InferencePublishTarget(api_base=choice.api_base, session_id=choice.session_id)
+
+
+def to_normalized_bbox_xywh(
+    x1: int, y1: int, x2: int, y2: int, frame_w: int, frame_h: int
+) -> list[float]:
+    safe_w = max(1, frame_w)
+    safe_h = max(1, frame_h)
+    nx1 = max(0.0, min(1.0, x1 / safe_w))
+    ny1 = max(0.0, min(1.0, y1 / safe_h))
+    nx2 = max(0.0, min(1.0, x2 / safe_w))
+    ny2 = max(0.0, min(1.0, y2 / safe_h))
+    left = min(nx1, nx2)
+    top = min(ny1, ny2)
+    right = max(nx1, nx2)
+    bottom = max(ny1, ny2)
+    return [
+        round(left, 6),
+        round(top, 6),
+        round(max(0.0, right - left), 6),
+        round(max(0.0, bottom - top), 6),
+    ]
+
+
+def build_inference_payload(
+    objects: list[dict[str, Any]],
+) -> dict[str, Any]:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    if objects:
+        top = max(objects, key=lambda item: float(item.get("confidence") or 0.0))
+        top_label = str(top.get("label") or "object")
+        scene_summary = f"Detected {len(objects)} object(s): {', '.join(str(item.get('label')) for item in objects[:4])}"
+        guidance_text = f"Caution: {top_label} ahead."
+    else:
+        scene_summary = "No objects detected in current frame."
+        guidance_text = "Path appears clear."
+
+    return {
+        "timestamp": timestamp,
+        "guidance_text": guidance_text,
+        "scene_summary": scene_summary,
+        "objects": objects,
+    }
+
+
 def draw_box_with_label(
     frame: np.ndarray, box: tuple[int, int, int, int], label: str, color: tuple[int, int, int]
 ) -> None:
@@ -406,9 +545,32 @@ def resolve_class_name(names: Any, class_id: int) -> str:
 def main() -> int:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
+    publisher: InferencePublisher | None = None
 
     try:
-        source = open_source_with_retry(args, project_root)
+        publish_target = resolve_publish_target(args, project_root)
+        if args.source:
+            source = open_source_with_retry(args, project_root)
+        else:
+            if publish_target is None:
+                raise RuntimeError("Could not resolve live feed/session to open source.")
+            source = SnapshotHttpSource(
+                f"{publish_target.api_base}/debug/sessions/{publish_target.session_id}/latest.jpg",
+                poll_interval=args.poll_interval,
+            )
+        if publish_target is not None:
+            publisher = InferencePublisher(
+                api_base=publish_target.api_base,
+                session_id=publish_target.session_id,
+            )
+            print(
+                "[INFO] Publishing detections to "
+                f"{publish_target.api_base}/debug/sessions/{publish_target.session_id}/inference"
+            )
+        elif args.source:
+            print(
+                "[INFO] Inference publish disabled (set --api-base and --session-id with --source to enable)."
+            )
     except KeyboardInterrupt:
         print("\n[INFO] Waiting cancelled by user.")
         return 0
@@ -460,7 +622,9 @@ def main() -> int:
 
             names = model.names
             boxes = result.boxes
+            detection_objects: list[dict[str, Any]] = []
             if boxes is not None:
+                frame_h, frame_w = frame.shape[:2]
                 for det in boxes:
                     coords = det.xyxy[0].tolist()
                     x1, y1, x2, y2 = (int(v) for v in coords)
@@ -469,6 +633,23 @@ def main() -> int:
                     label_name = resolve_class_name(names, class_id)
                     label = f"{label_name} {conf:.2f}"
                     draw_box_with_label(frame, (x1, y1, x2, y2), label, color=(0, 220, 90))
+                    detection_objects.append(
+                        {
+                            "label": label_name,
+                            "confidence": round(conf, 6),
+                            "bbox": to_normalized_bbox_xywh(
+                                x1=x1,
+                                y1=y1,
+                                x2=x2,
+                                y2=y2,
+                                frame_w=frame_w,
+                                frame_h=frame_h,
+                            ),
+                        }
+                    )
+
+            if publisher is not None:
+                publisher.publish(build_inference_payload(detection_objects))
 
             current = time.perf_counter()
             dt = max(1e-6, current - last_frame_time)
@@ -487,6 +668,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.")
     finally:
+        if publisher is not None:
+            publisher.close()
         source.close()
         cv2.destroyAllWindows()
 
