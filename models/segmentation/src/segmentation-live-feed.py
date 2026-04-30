@@ -10,8 +10,8 @@ import statistics
 from time import perf_counter
 
 
-BASE_DIR = Path(__file__).resolve().parent # # LENS-PLUS/models/segmentation/src
-PROJECT_ROOT = BASE_DIR.parents[2] # LENS PLUS
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parents[2]
 DEEPLAB_PATH = BASE_DIR / "DeepLabV3Plus-Pytorch"
 sys.path.insert(0, str(DEEPLAB_PATH))
 
@@ -604,22 +604,6 @@ class ImprovedSegmentation:
             else:
                 yolo_results = None
 
-            detections = []
-
-            if yolo_results and yolo_results[0].boxes is not None:
-                for box in yolo_results[0].boxes:
-                    xyxy = box.xyxy[0].tolist()
-                    conf = float(box.conf[0])
-                    cls_id = int(box.cls[0])
-                    label = self.yolo_model.names[cls_id]
-                    detections.append({
-                        "label": label,
-                        "confidence": round(conf, 3),
-                        "xyxy": [round(v, 1) for v in xyxy]
-                    })
-            sidecar_path = frame_path.with_suffix(".detections.json")
-            sidecar_path.write_text(json.dumps({"detections": detections}, indent=2))
-
             t0 = perf_counter()
 
             if processed_count % self.deeplab_every_n_frames == 0:
@@ -815,7 +799,7 @@ class ImprovedSegmentation:
                 elif is_closed and unmerged_count > 0:
                     print(f"Flushing final {unmerged_count} leftover groups into a demo...")
                     batch_keys = processed_order[last_merged_count:]
-                    self._merge_demo(artifact.name, batch_keys, demo_batch_num)
+                    self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
                     last_merged_count += unmerged_count
                     demo_batch_num += 1
 
@@ -828,7 +812,7 @@ if __name__ == "__main__":
     model = ImprovedSegmentation(
         frames_root=f"{APP_DIR}/session_artifacts",
         yolo_model_path=str(BASE_DIR / "yolov8n-seg.pt"),
-        deeplab_model_path=str(BASE_DIR / "deeplabv3plus-mobilenet.pth"),
+        deeplab_model_path=str(BASE_DIR / "deeplabv3plus_mobilenet_finetuned.pth"),
         target_fps=10,
         use_yolo=True,
         deeplab_every_n_frames=2,

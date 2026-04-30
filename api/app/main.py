@@ -822,7 +822,9 @@ def sanitize_artifact_component(value: str) -> str:
     return sanitized or "session"
 
 
-def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str | None, Path | None, Path | None, str | None]:
+def create_session_artifact(
+    session_id: str, started_at: datetime
+) -> tuple[str | None, Path | None, Path | None, str | None]:
     safe_session_id = sanitize_artifact_component(session_id)
     started_fragment = started_at.strftime("%Y%m%dT%H%M%S%fZ")
     artifact_id = f"{started_fragment}--{safe_session_id}"
@@ -831,8 +833,6 @@ def create_session_artifact(session_id: str, started_at: datetime) -> tuple[str 
 
     try:
         artifact_dir.mkdir(parents=True, exist_ok=False)
-
-    
     except FileExistsError:
         artifact_id = f"{artifact_id}--{uuid.uuid4().hex[:8]}"
         artifact_dir = SESSION_ARTIFACTS_ROOT / artifact_id
@@ -1058,14 +1058,17 @@ def persist_processed_frame(
         "group_id": group_number,
         "group_dir": group_dir.name,
         "directional": directional_context,
+        "detections": detection_context,
+        "object-detected": object_detected,
     }
+    if overlay_error is not None:
+        frame_metadata["detection_overlay_error"] = overlay_error
 
     try:
         frame_path.write_bytes(rendered_frame_jpeg)
         metadata_path.write_text(json.dumps(frame_metadata, indent=2) + "\n")
         session.dumped_frames += 1
         session.last_dump_error = None
-
     except Exception as error:
         session.dump_errors += 1
         session.last_dump_error = f"frame dump failed: {error}"

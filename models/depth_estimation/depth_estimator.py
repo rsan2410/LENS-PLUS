@@ -181,8 +181,6 @@ class DepthZoneAnalyser:
         left_mean = zone_mean_m["left"]
         centre_mean = zone_mean_m["centre"]
         right_mean = zone_mean_m["right"]
-        # left_near = zone_nearest_m["left"]
-        # right_near = zone_nearest_m["right"]
         centre_near = zone_nearest_m["centre"]
         floor_near = zone_nearest_m["floor"]
 
@@ -192,13 +190,6 @@ class DepthZoneAnalyser:
         )
 
         buffer_m = 0.15
-
-        # if left_near < centre_near and left_near < right_near:
-        #     direction_warning = "on your left"
-        # elif right_near < centre_near and right_near < left_near:
-        #     direction_warning = "on your right"
-        # else:
-        #     direction_warning = "ahead"
 
         if left_mean < centre_mean - buffer_m and left_mean < right_mean:
             direction_warning = "on your left"
@@ -449,7 +440,6 @@ class DepthEstimator:
         else:
             norm = np.zeros_like(depth)
 
-        # clipped = np.clip(depth, 0, self.max_depth)
         norm = 1.0 - norm
 
         cmap = plt.get_cmap("Spectral_r")
@@ -769,6 +759,6 @@ if __name__ == "__main__":
         ),
         target_fps=10,
         max_depth=10.0,
-        camera_hfov_deg=70.0,  # calibrate for better accuracy
+        camera_hfov_deg=70.0
     )
     model.run()
